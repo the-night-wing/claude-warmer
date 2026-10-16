@@ -82,6 +82,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      CODEX_FAILED: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -174,6 +180,91 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .state/claude-last-warm.txt
           git commit -m "chore: warm claude $(TZ='America/Chicago' date '+%F %H:%M %Z')" || exit 0
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && break
+            sleep $((RANDOM % 5 + 1))
+          done
+
+      - name: Capture warm-up result
+        id: warm_result
+        if: ${{ always() }}
+        run: echo "failed=${{ job.status == 'failure' }}" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------------------------
+      # Notify — the only time you should ever need to look at this repo. If a
+      # warm job fails (all 3 retries exhausted - a real auth/CLI problem, not a
+      # blip), open one GitHub issue with the exact fix. GitHub emails repo
+      # owners on new issues/comments by default, so this reaches you without
+      # anyone polling Actions. Once things succeed again, auto-close it.
+      # --------------------------------------------------------------------------
+      - name: Open or update failure issue
+        if: ${{ always() && steps.warm_result.outputs.failed == 'true' }}
+        env:
+          CLAUDE_FAILED: ${{ steps.warm_result.outputs.failed }}
+        run: |
+          title="Warm-up needs attention"
+          existing=$(gh issue list --repo "$REPO" --state open --json number,title \
+            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
+
+          body="Automated warm-up failed after 3 retries. Failed run: $RUN_URL"$'\n\n'
+
+          if [ "$CLAUDE_FAILED" = "true" ]; then
+            body+="### Claude"$'\n'
+            body+='Likely an expired/revoked OAuth token. Fix (run in your own terminal):'$'\n'
+            body+='```bash'$'\n'
+            body+='claude setup-token'$'\n'
+            body+="gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo $REPO"$'\n'
+            body+='```'$'\n\n'
+          fi
+
+          if [ "$CODEX_FAILED" = "true" ]; then
+            body+="### Codex"$'\n'
+            body+='Refresh token is dead (OpenAI has no long-lived CI credential). Fix (run in your own terminal):'$'\n'
+            body+='```bash'$'\n'
+            body+='codex login'$'\n'
+            body+="gh secret set CODEX_AUTH_JSON --repo $REPO < ~/.codex/auth.json"$'\n'
+            body+='```'$'\n\n'
+            body+='**Do NOT run `codex login` again afterwards.** OpenAI issues one refresh-token family per account, so a second login revokes the token you just uploaded and CI fails with `token_revoked`. Upload the auth.json from your most recent login, then leave it alone.'$'\n\n'
+          fi
+
+          body+="This issue will auto-close the next time Claude warming succeeds."
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
+
+      - name: Close resolved failure issue
+        if: ${{ always() && steps.warm_result.outputs.failed == 'false' }}
+        run: |
+          title="Warm-up needs attention"
+          existing=$(gh issue list --repo "$REPO" --state open --json number,title \
+            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" --repo "$REPO" \
+              --comment "Resolved - a subsequent run succeeded. Closing automatically."
+          fi
+
+      # --------------------------------------------------------------------------
+      # Heartbeat — keeps the repo "active" so GitHub never auto-disables the
+      # schedule after 60 idle days, even if both warm jobs are failing.
+      # Committing on every trigger would be 48 commits/day of noise, so it
+      # commits at most once per calendar day.
+      # --------------------------------------------------------------------------
+      - name: Commit timestamp (once per day)
+        if: ${{ always() }}
+        run: |
+          today=$(date -u +%F)
+          if [ "$(cut -c1-10 heartbeat.txt 2>/dev/null)" = "$today" ]; then
+            echo "Heartbeat already committed today ($today) - skipping."
+            exit 0
+          fi
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add heartbeat.txt
+          git commit -m "chore: heartbeat $(cat heartbeat.txt)" || exit 0
           for i in 1 2 3; do
             git pull --rebase --autostash && git push && break
             sleep $((RANDOM % 5 + 1))
@@ -318,105 +409,6 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .state/codex-last-warm.txt
           git commit -m "chore: warm codex $(TZ='America/Chicago' date '+%F %H:%M %Z')" || exit 0
-          for i in 1 2 3; do
-            git pull --rebase --autostash && git push && break
-            sleep $((RANDOM % 5 + 1))
-          done
-
-  # --------------------------------------------------------------------------
-  # Notify — the only time you should ever need to look at this repo. If a
-  # warm job fails (all 3 retries exhausted - a real auth/CLI problem, not a
-  # blip), open one GitHub issue with the exact fix. GitHub emails repo
-  # owners on new issues/comments by default, so this reaches you without
-  # anyone polling Actions. Once things succeed again, auto-close it.
-  # --------------------------------------------------------------------------
-  notify:
-    needs: [warm-claude]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    permissions:
-      issues: write
-    env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      REPO: ${{ github.repository }}
-      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      CLAUDE_FAILED: ${{ needs.warm-claude.result == 'failure' }}
-      CODEX_FAILED: ${{ needs.warm-codex.result == 'failure' }}
-    steps:
-      - name: Open or update failure issue
-        if: env.CLAUDE_FAILED == 'true' || env.CODEX_FAILED == 'true'
-        run: |
-          title="Warm-up needs attention"
-          existing=$(gh issue list --repo "$REPO" --state open --json number,title \
-            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
-
-          body="Automated warm-up failed after 3 retries. Failed run: $RUN_URL"$'\n\n'
-
-          if [ "$CLAUDE_FAILED" = "true" ]; then
-            body+="### Claude"$'\n'
-            body+='Likely an expired/revoked OAuth token. Fix (run in your own terminal):'$'\n'
-            body+='```bash'$'\n'
-            body+='claude setup-token'$'\n'
-            body+="gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo $REPO"$'\n'
-            body+='```'$'\n\n'
-          fi
-
-          if [ "$CODEX_FAILED" = "true" ]; then
-            body+="### Codex"$'\n'
-            body+='Refresh token is dead (OpenAI has no long-lived CI credential). Fix (run in your own terminal):'$'\n'
-            body+='```bash'$'\n'
-            body+='codex login'$'\n'
-            body+="gh secret set CODEX_AUTH_JSON --repo $REPO < ~/.codex/auth.json"$'\n'
-            body+='```'$'\n\n'
-            body+='**Do NOT run `codex login` again afterwards.** OpenAI issues one refresh-token family per account, so a second login revokes the token you just uploaded and CI fails with `token_revoked`. Upload the auth.json from your most recent login, then leave it alone.'$'\n\n'
-          fi
-
-          body+="This issue will auto-close the next time both jobs succeed."
-
-          if [ -n "$existing" ]; then
-            gh issue comment "$existing" --repo "$REPO" --body "$body"
-          else
-            gh issue create --repo "$REPO" --title "$title" --body "$body"
-          fi
-
-      - name: Close resolved failure issue
-        if: env.CLAUDE_FAILED == 'false' && env.CODEX_FAILED == 'false'
-        run: |
-          title="Warm-up needs attention"
-          existing=$(gh issue list --repo "$REPO" --state open --json number,title \
-            --jq '[.[] | select(.title=="'"$title"'")][0].number // empty')
-          if [ -n "$existing" ]; then
-            gh issue close "$existing" --repo "$REPO" \
-              --comment "Resolved - a subsequent run succeeded. Closing automatically."
-          fi
-
-  # --------------------------------------------------------------------------
-  # Heartbeat — keeps the repo "active" so GitHub never auto-disables the
-  # schedule after 60 idle days, even if both warm jobs are failing.
-  # Committing on every trigger would be 48 commits/day of noise, so it
-  # commits at most once per calendar day.
-  # --------------------------------------------------------------------------
-  heartbeat:
-    needs: [warm-claude]
-    if: ${{ always() }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Commit timestamp (once per day)
-        run: |
-          today=$(date -u +%F)
-          if [ "$(cut -c1-10 heartbeat.txt 2>/dev/null)" = "$today" ]; then
-            echo "Heartbeat already committed today ($today) - skipping."
-            exit 0
-          fi
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add heartbeat.txt
-          git commit -m "chore: heartbeat $(cat heartbeat.txt)" || exit 0
           for i in 1 2 3; do
             git pull --rebase --autostash && git push && break
             sleep $((RANDOM % 5 + 1))
